@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { Navigate, NavLink, Route, Routes } from 'react-router-dom'
 import './App.css'
 
@@ -39,6 +39,35 @@ type BreakdownItem = {
   category: string
   amount: number
   percentage: number
+}
+
+type HealthTone = 'good' | 'warn' | 'danger'
+
+type HealthSignal = {
+  label: string
+  value: string
+  note: string
+  tone: HealthTone
+}
+
+type HealthSnapshot = {
+  score: number
+  label: string
+  summary: string
+  tone: HealthTone
+  signals: HealthSignal[]
+}
+
+type CategoryDetail = {
+  category: string
+  total: number
+  count: number
+  average: number
+  share: number
+  topMerchant: { name: string; amount: number } | null
+  recent: Transaction[]
+  trend: { month: string; label: string; amount: number }[]
+  trendMax: number
 }
 
 const STORAGE_KEY = 'zorvyn-finance-dashboard-v1'
@@ -118,6 +147,56 @@ const formatMonth = (value: string) => monthFormatter.format(new Date(`${value}-
 const getMonthKey = (value: string) => value.slice(0, 7)
 const compareValues = (left: string, right: string) => left.localeCompare(right)
 const buildPath = (points: { x: number; y: number }[]) => points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(' ')
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
+
+function useAnimatedNumber(target: number, duration = 850) {
+  const [animatedValue, setAnimatedValue] = useState(0)
+  const animatedValueRef = useRef(0)
+
+  useEffect(() => {
+    animatedValueRef.current = animatedValue
+  }, [animatedValue])
+
+  useEffect(() => {
+    let frame = 0
+    const startValue = animatedValueRef.current
+    const startTime = performance.now()
+
+    const tick = (now: number) => {
+      const progress = clamp((now - startTime) / duration, 0, 1)
+      const eased = 1 - (1 - progress) ** 3
+      const nextValue = startValue + (target - startValue) * eased
+
+      setAnimatedValue(nextValue)
+
+      if (progress < 1) {
+        frame = window.requestAnimationFrame(tick)
+      }
+    }
+
+    frame = window.requestAnimationFrame(tick)
+
+    return () => window.cancelAnimationFrame(frame)
+  }, [duration, target])
+
+  return animatedValue
+}
+
+function AnimatedValue({
+  value,
+  formatter,
+  duration = 850,
+  className = 'animated-value',
+}: {
+  value: number
+  formatter: (current: number) => string
+  duration?: number
+  className?: string
+}) {
+  const animatedValue = useAnimatedNumber(value, duration)
+
+  return <span className={className}>{formatter(animatedValue)}</span>
+}
 
 function App() {
   const snapshot = readStorage()
@@ -131,6 +210,7 @@ function App() {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [draft, setDraft] = useState<DraftTransaction>(() => emptyDraft())
   const [statusMessage, setStatusMessage] = useState('')
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
@@ -295,6 +375,7 @@ function App() {
 
   const netFlow = summaries.income - summaries.expenses
   const monthlyRunway = summaries.expenses > 0 ? summaries.balance / summaries.expenses : 0
+  const expenseTotal = summaries.expenses
 
   const trendChart = useMemo(() => {
     const width = 680
@@ -319,6 +400,109 @@ function App() {
 
     return { width, height, padding, path: buildPath(points), points }
   }, [monthlySeries])
+
+  const selectedCategoryDetail = useMemo<CategoryDetail | null>(() => {
+    if (!selectedCategory) {
+      return null
+    }
+
+    const categoryTransactions = transactions.filter((transaction) => transaction.type === 'expense' && transaction.category === selectedCategory)
+
+    if (categoryTransactions.length === 0) {
+      return null
+    }
+
+    const total = categoryTransactions.reduce((sum, transaction) => sum + transaction.amount, 0)
+    const merchantTotals = new Map<string, number>()
+    const monthTotals = new Map<string, number>()
+
+    categoryTransactions.forEach((transaction) => {
+      merchantTotals.set(transaction.merchant, (merchantTotals.get(transaction.merchant) ?? 0) + transaction.amount)
+      const month = getMonthKey(transaction.date)
+      monthTotals.set(month, (monthTotals.get(month) ?? 0) + transaction.amount)
+    })
+
+    const recent = [...categoryTransactions].sort((left, right) => new Date(right.date).getTime() - new Date(left.date).getTime()).slice(0, 4)
+    const trend = Array.from(monthTotals.entries())
+      .sort((left, right) => left[0].localeCompare(right[0]))
+      .map(([month, amount]) => ({ month, label: formatMonth(month), amount }))
+    const trendMax = trend.length > 0 ? Math.max(...trend.map((point) => point.amount)) : 1
+    const topMerchantEntry = Array.from(merchantTotals.entries()).sort((left, right) => right[1] - left[1])[0]
+
+    return {
+      category: selectedCategory,
+      total,
+      count: categoryTransactions.length,
+      average: total / categoryTransactions.length,
+      share: expenseTotal > 0 ? (total / expenseTotal) * 100 : 0,
+      topMerchant: topMerchantEntry ? { name: topMerchantEntry[0], amount: topMerchantEntry[1] } : null,
+      recent,
+      trend,
+      trendMax,
+    }
+  }, [expenseTotal, selectedCategory, transactions])
+
+  const financialHealth = useMemo<HealthSnapshot>(() => {
+    const savingsScore = clamp(summaries.savingsRate * 1.8, 0, 100)
+    const runwayScore = clamp(monthlyRunway * 20, 0, 100)
+    const momentumScore = monthlyComparison ? clamp(68 - monthlyComparison.percentage * 0.6, 0, 100) : 62
+    const concentrationScore = highestSpendingCategory ? clamp(100 - highestSpendingCategory.percentage * 1.1, 0, 100) : 70
+
+    const score = Math.round(savingsScore * 0.42 + runwayScore * 0.28 + momentumScore * 0.18 + concentrationScore * 0.12)
+    const tone: HealthTone = score >= 80 ? 'good' : score >= 55 ? 'warn' : 'danger'
+
+    const label = score >= 80 ? 'Strong' : score >= 55 ? 'Stable' : 'Needs attention'
+    const summary =
+      score >= 80
+        ? 'Savings, runway, and expense balance are all trending in the right direction.'
+        : score >= 55
+          ? 'The budget is steady, but there is room to reduce concentration and lift savings.'
+          : 'The current pattern needs tighter control before expenses start compounding.'
+
+    const savingsTone: HealthTone = savingsScore >= 60 ? 'good' : savingsScore >= 35 ? 'warn' : 'danger'
+    const runwayTone: HealthTone = monthlyRunway >= 3 ? 'good' : monthlyRunway >= 1.5 ? 'warn' : 'danger'
+    const momentumTone: HealthTone = !monthlyComparison || monthlyComparison.percentage <= 0 ? 'good' : monthlyComparison.percentage <= 18 ? 'warn' : 'danger'
+    const concentrationTone: HealthTone = !highestSpendingCategory
+      ? 'good'
+      : highestSpendingCategory.percentage <= 35
+        ? 'good'
+        : highestSpendingCategory.percentage <= 50
+          ? 'warn'
+          : 'danger'
+
+    return {
+      score,
+      label,
+      summary,
+      tone,
+      signals: [
+        {
+          label: 'Savings rate',
+          value: `${summaries.savingsRate.toFixed(1)}%`,
+          note: 'Share of income retained after expenses.',
+          tone: savingsTone,
+        },
+        {
+          label: 'Runway',
+          value: monthlyRunway > 0 ? `${monthlyRunway.toFixed(1)} mo` : 'N/A',
+          note: 'How long the current balance can cover spending.',
+          tone: runwayTone,
+        },
+        {
+          label: 'Spending momentum',
+          value: monthlyComparison ? `${monthlyComparison.percentage >= 0 ? '+' : ''}${monthlyComparison.percentage.toFixed(1)}%` : 'No trend yet',
+          note: monthlyComparison ? 'Expense change versus the previous month.' : 'Need more months to build a trend line.',
+          tone: momentumTone,
+        },
+        {
+          label: 'Category concentration',
+          value: highestSpendingCategory ? `${highestSpendingCategory.category} · ${highestSpendingCategory.percentage.toFixed(0)}%` : 'Balanced',
+          note: 'Lower concentration usually means healthier spending mix.',
+          tone: concentrationTone,
+        },
+      ],
+    }
+  }, [highestSpendingCategory, monthlyComparison, monthlyRunway, summaries.savingsRate])
 
   const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -491,7 +675,11 @@ function App() {
               monthlySeries={monthlySeries}
               trendChart={trendChart}
               breakdown={breakdown}
+              selectedCategory={selectedCategory}
+              setSelectedCategory={setSelectedCategory}
+              selectedCategoryDetail={selectedCategoryDetail}
               formatCurrency={formatCurrency}
+              formatDate={formatDate}
             />
           }
         />
@@ -529,6 +717,7 @@ function App() {
               summaries={summaries}
               highestSpendingCategory={highestSpendingCategory}
               monthlyComparison={monthlyComparison}
+              financialHealth={financialHealth}
               formatCurrency={formatCurrency}
             />
           }
@@ -540,20 +729,22 @@ function App() {
         <article className="quick-stat card">
           <p>Net cash flow</p>
           <strong className={netFlow >= 0 ? 'positive' : 'negative'}>
-            {netFlow >= 0 ? '+' : '-'}{formatCurrency(Math.abs(netFlow))}
+            {netFlow >= 0 ? '+' : '-'}<AnimatedValue value={Math.abs(netFlow)} formatter={formatCurrency} />
           </strong>
           <span>Income minus expense</span>
         </article>
 
         <article className="quick-stat card">
           <p>Average monthly spend</p>
-          <strong>{formatCurrency(Math.round(averageMonthlyExpense))}</strong>
+          <strong>
+            <AnimatedValue value={averageMonthlyExpense} formatter={formatCurrency} />
+          </strong>
           <span>Across {monthlySeries.length || 0} month(s)</span>
         </article>
 
         <article className="quick-stat card">
           <p>Estimated runway</p>
-          <strong>{monthlyRunway > 0 ? `${monthlyRunway.toFixed(1)} mo` : 'N/A'}</strong>
+          <strong>{monthlyRunway > 0 ? <AnimatedValue value={monthlyRunway} formatter={(value) => `${value.toFixed(1)} mo`} /> : 'N/A'}</strong>
           <span>Based on current balance and spend</span>
         </article>
       </section>
@@ -566,35 +757,51 @@ function OverviewPage({
   monthlySeries,
   trendChart,
   breakdown,
+  selectedCategory,
+  setSelectedCategory,
+  selectedCategoryDetail,
   formatCurrency,
+  formatDate,
 }: {
   summaries: { income: number; expenses: number; balance: number; savingsRate: number }
   monthlySeries: MonthlyPoint[]
   trendChart: { width: number; height: number; padding: number; path: string; points: { x: number; y: number }[] }
   breakdown: BreakdownItem[]
+  selectedCategory: string | null
+  setSelectedCategory: React.Dispatch<React.SetStateAction<string | null>>
+  selectedCategoryDetail: CategoryDetail | null
   formatCurrency: (value: number) => string
+  formatDate: (value: string) => string
 }) {
   return (
     <>
       <section className="summary-grid">
         <article className="card summary-card balance-card">
           <p className="card-label">Total balance</p>
-          <h2>{formatCurrency(summaries.balance)}</h2>
+          <h2>
+            <AnimatedValue value={summaries.balance} formatter={formatCurrency} />
+          </h2>
           <p className="card-note">Current standing after all recorded income and expenses.</p>
         </article>
         <article className="card summary-card">
           <p className="card-label">Income</p>
-          <h2 className="positive">{formatCurrency(summaries.income)}</h2>
+          <h2 className="positive">
+            <AnimatedValue value={summaries.income} formatter={formatCurrency} />
+          </h2>
           <p className="card-note">Money received this period.</p>
         </article>
         <article className="card summary-card">
           <p className="card-label">Expenses</p>
-          <h2 className="negative">{formatCurrency(summaries.expenses)}</h2>
+          <h2 className="negative">
+            <AnimatedValue value={summaries.expenses} formatter={formatCurrency} />
+          </h2>
           <p className="card-note">Total outflow across tracked categories.</p>
         </article>
         <article className="card summary-card">
           <p className="card-label">Savings rate</p>
-          <h2>{summaries.savingsRate.toFixed(1)}%</h2>
+          <h2>
+            <AnimatedValue value={summaries.savingsRate} formatter={(value) => `${value.toFixed(1)}%`} />
+          </h2>
           <p className="card-note">Income retained after expenses.</p>
         </article>
       </section>
@@ -661,7 +868,13 @@ function OverviewPage({
             {breakdown.length > 0 ? (
               <div className="breakdown-list">
                 {breakdown.map((item) => (
-                  <div key={item.category} className="breakdown-row">
+                  <button
+                    key={item.category}
+                    type="button"
+                    className={`breakdown-row breakdown-button ${selectedCategory === item.category ? 'is-selected' : ''}`}
+                    onClick={() => setSelectedCategory(item.category)}
+                    aria-pressed={selectedCategory === item.category}
+                  >
                     <div className="breakdown-meta">
                       <span>{item.category}</span>
                       <strong>{formatCurrency(item.amount)}</strong>
@@ -670,12 +883,79 @@ function OverviewPage({
                       <span className="progress-fill" style={{ width: `${Math.max(item.percentage, 8)}%` }} />
                     </div>
                     <span className="breakdown-percentage">{item.percentage.toFixed(0)}%</span>
-                  </div>
+                  </button>
                 ))}
               </div>
             ) : (
               <EmptyState title="No expense data" description="Expenses will appear here once they are added." />
             )}
+
+            {selectedCategoryDetail ? (
+              <article className="card drilldown-card">
+                <div className="section-heading">
+                  <div>
+                    <p className="eyebrow">Category drill-down</p>
+                    <h3>{selectedCategoryDetail.category}</h3>
+                  </div>
+                  <button type="button" className="text-button" onClick={() => setSelectedCategory(null)}>
+                    Clear
+                  </button>
+                </div>
+
+                <div className="drilldown-grid">
+                  <div className="drilldown-metric">
+                    <span>Total spend</span>
+                    <strong>{formatCurrency(selectedCategoryDetail.total)}</strong>
+                  </div>
+                  <div className="drilldown-metric">
+                    <span>Transactions</span>
+                    <strong>{selectedCategoryDetail.count}</strong>
+                  </div>
+                  <div className="drilldown-metric">
+                    <span>Average ticket</span>
+                    <strong>{formatCurrency(selectedCategoryDetail.average)}</strong>
+                  </div>
+                  <div className="drilldown-metric">
+                    <span>Share of spend</span>
+                    <strong>{selectedCategoryDetail.share.toFixed(0)}%</strong>
+                  </div>
+                </div>
+
+                <div className="drilldown-track-list">
+                  {selectedCategoryDetail.trend.map((point) => (
+                    <div key={point.month} className="drilldown-track-row">
+                      <div className="drilldown-track-copy">
+                        <span>{point.label}</span>
+                        <strong>{formatCurrency(point.amount)}</strong>
+                      </div>
+                      <div className="progress-track drilldown-track">
+                        <span className="progress-fill" style={{ width: `${Math.max((point.amount / selectedCategoryDetail.trendMax) * 100, 10)}%` }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="drilldown-recent">
+                  <div className="drilldown-recent-heading">
+                    <span>Recent entries</span>
+                    <span>{selectedCategoryDetail.topMerchant ? `Top merchant: ${selectedCategoryDetail.topMerchant.name}` : 'No merchant data'}</span>
+                  </div>
+                  {selectedCategoryDetail.recent.map((transaction) => (
+                    <article key={transaction.id} className="drilldown-transaction">
+                      <div>
+                        <strong>{transaction.merchant}</strong>
+                        <span>{formatDate(transaction.date)}</span>
+                      </div>
+                      <strong className="negative">-{formatCurrency(transaction.amount)}</strong>
+                    </article>
+                  ))}
+                </div>
+              </article>
+            ) : breakdown.length > 0 ? (
+              <article className="card drilldown-card">
+                <EmptyState title="Pick a category" description="Click any spending category above to inspect its merchant mix and monthly trend." />
+              </article>
+            ) : null}
           </section>
         </div>
       </section>
@@ -899,6 +1179,7 @@ function InsightsPage({
   summaries,
   highestSpendingCategory,
   monthlyComparison,
+  financialHealth,
   formatCurrency,
 }: {
   summaries: { income: number; expenses: number; balance: number; savingsRate: number }
@@ -911,11 +1192,47 @@ function InsightsPage({
     change: number
     percentage: number
   } | null
+  financialHealth: HealthSnapshot
   formatCurrency: (value: number) => string
 }) {
   return (
     <section className="content-grid single-main-grid">
       <div className="content-column">
+        <section className="card health-card">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Financial health</p>
+              <h3>How stable is the budget?</h3>
+            </div>
+            <span className="muted-copy">Derived from savings, runway, and spending balance</span>
+          </div>
+
+          <div className="health-layout">
+            <div className={`health-gauge tone-${financialHealth.tone}`} style={{ ['--health-progress' as string]: `${financialHealth.score}%` } as CSSProperties}>
+              <div className="health-gauge-inner">
+                <p>Score</p>
+                <strong>
+                  <AnimatedValue value={financialHealth.score} formatter={(value) => String(Math.round(value))} />
+                </strong>
+                <span>{financialHealth.label}</span>
+              </div>
+            </div>
+
+            <div className="health-copy">
+              <p>{financialHealth.summary}</p>
+              <div className="health-signals">
+                {financialHealth.signals.map((signal) => (
+                  <article key={signal.label} className={`health-signal tone-${signal.tone}`}>
+                    <span>{signal.label}</span>
+                    <strong>{signal.value}</strong>
+                    <p>{signal.note}</p>
+                  </article>
+                ))}
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section className="card insights-card">
           <div className="section-heading">
             <div>
